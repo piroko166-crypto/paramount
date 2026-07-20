@@ -6,7 +6,7 @@ from aiohttp import ClientSession
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# 1. Initialize the FastAPI app (Vercel looks for this variable name)
+# 1. Initialize the FastAPI app (Vercel searches for this specific variable)
 app = FastAPI()
 
 COUNTRY_MAP = {
@@ -78,7 +78,7 @@ COUNTRY_MAP = {
     "ZM": "Zambia 🇿🇲", "ZW": "Zimbabwe 🇿🇼"
 }
 
-# 2. Define Pydantic Input Schema
+# 2. Define Pydantic Input Schema with Default Eclipse Proxy Info
 class CheckInput(BaseModel):
     username: str
     password: str
@@ -104,7 +104,7 @@ def format_proxy(raw_proxy: str) -> Optional[str]:
         pass
     return None
 
-# 3. Create FastAPI Route
+# 3. FastAPI Post Endpoint
 @app.post("/check")
 async def run_check(payload: CheckInput):
     device_id = secrets.token_hex(8).lower()
@@ -132,7 +132,7 @@ async def run_check(payload: CheckInput):
         headers["x-tp-proxy"] = proxy_url
 
     async with ClientSession() as session:
-        # Request 1
+        # Request 1: Auth
         login_url = "https://www.intl.paramountplus.com/apps-api/v2.1/androidphone/auth/login.json?locale=en-us&at=ABC74o%2B31mI%2F%2FzQ3GstOJMJJ%2FgdJGAU5PCKXsJ%2B%2BroG%2FyHi2O754P8Ojsak4Ev7LXck%3D"
         headers["x-tp-url"] = login_url
         headers["x-tp-method"] = "POST"
@@ -154,7 +154,7 @@ async def run_check(payload: CheckInput):
         if "userId" not in body:
             return {"status": "BAN/UNKNOWN"}
 
-        # Request 2
+        # Request 2: Plan Status Check
         status_url = "https://www.intl.paramountplus.com/apps-api/v3.0/androidphone/login/status.json?locale=en-us&at=ABAe6KaaPmQXoXXr2FS9yDys4wXLwooaEREtz0c6agC7vrQhjTY%2FYfp1dfSDtu9EbB0%3D"
         headers["x-tp-url"] = status_url
         headers["x-tp-method"] = "GET"
