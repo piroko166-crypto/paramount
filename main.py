@@ -104,7 +104,11 @@ def format_proxy(raw_proxy: str) -> Optional[str]:
         pass
     return None
 
-# 3. Create FastAPI Route
+# 3. Create FastAPI Routes
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 @app.post("/check")
 async def run_check(payload: CheckInput):
     device_id = secrets.token_hex(8).lower()
