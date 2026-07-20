@@ -1,20 +1,19 @@
-import asyncio
 import re
 import secrets
 import random
 import urllib.parse
 from typing import Optional
 
+import tls_client  # <-- new dependency (works on Vercel)
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from curl_cffi import requests as curl_requests   # <-- new dependency
 
 app = FastAPI()
 
-# ---------- Country Map (unchanged) ----------
+# ---------- Full country map (keep yours) ----------
 COUNTRY_MAP = {
     "AF": "Afganistan 🇦🇫", "AX": "Åland Islands 🇫🇮", "AL": "Albania 🇦🇱", "DZ": "Algeria 🇩🇿",
-    # ... (keep your full map, omitted for brevity but must be included in your code)
+    # ... (include the complete map from your original code)
     "ZW": "Zimbabwe 🇿🇼"
 }
 
@@ -54,14 +53,14 @@ def get_random_user_agent() -> str:
     ]
     return random.choice(ua_list)
 
-# ---------- Endpoint ----------
+# ---------- Endpoint (synchronous) ----------
 @app.post("/check")
-async def run_check(payload: CheckInput):
+def run_check(payload: CheckInput):
     device_id = secrets.token_hex(8).lower()
     user_agent = get_random_user_agent()
     proxy_url = format_proxy(payload.proxy)
 
-    # Headers (exactly as in the original workflow)
+    # Headers (same as the original workflow)
     headers = {
         "Host": "www.intl.paramountplus.com",
         "Origin": "https://www.intl.paramountplus.com",
@@ -77,56 +76,47 @@ async def run_check(payload: CheckInput):
         "Newrelic": "eyJ2IjpbMCwyXSwiZCI6eyJ0eSI6Ik1vYmlsZSIsImFjIjoiMjkzNjM0OCIsImFwIjoiNzY2NTg1Nzg1IiwidHIiOiJjMjA2NzIwZTBmNWE0ZTEzODc3MDZkNjlkNTc3ODc3YyIsImlkIjoiMTBjYzY2ZjIxMjExNDUzMiIsInRpIjoxNzYzMTEzNTE0ODUyLCJ0ayI6IjIzMjE2MDYifX0="
     }
 
-    # Helper to perform a request with retries and TLS impersonation
-    async def do_request(method, url, data=None, max_retries=5):
-        # Use curl_cffi's AsyncSession with Chrome impersonation
-        async with curl_requests.AsyncSession(impersonate="chrome120") as session:
-            for attempt in range(max_retries):
-                try:
-                    if method.upper() == "POST":
-                        resp = await session.post(
-                            url,
-                            headers=headers,
-                            data=data,
-                            proxy=proxy_url,
-                            timeout=15
-                        )
-                    else:
-                        resp = await session.get(
-                            url,
-                            headers=headers,
-                            proxy=proxy_url,
-                            timeout=15
-                        )
-                    status = resp.status_code
-                    body = resp.text
-                    # Retry on error statuses (like original JUMP)
-                    if status in (500, 403, 406):
-                        continue
-                    return status, body
-                except Exception as e:
-                    # If it's a TLS/connection error, retry (but only up to max)
-                    if attempt == max_retries - 1:
-                        raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
-                    await asyncio.sleep(0.5)  # small delay before retry
-            raise HTTPException(status_code=500, detail="Max retries exceeded.")
+    # Create a TLS client that mimics Chrome 120
+    session = tls_client.Session(
+        client_identifier="chrome_120",  # Impersonates Chrome
+        random_tls_extension_order=True
+    )
 
-    # ----- Login Request -----
+    # Helper to perform request with retries
+    def do_request(method, url, data=None, max_retries=5):
+        for attempt in range(max_retries):
+            try:
+                if method.upper() == "POST":
+                    response = session.post(url, headers=headers, data=data, proxy=proxy_url, timeout_seconds=15)
+                else:
+                    response = session.get(url, headers=headers, proxy=proxy_url, timeout_seconds=15)
+                status = response.status_code
+                body = response.text
+                # Retry on error statuses (like original JUMP)
+                if status in (500, 403, 406):
+                    continue
+                return status, body
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Max retries exceeded.")
+
+    # ----- Login -----
     login_url = "https://www.intl.paramountplus.com/apps-api/v2.1/androidphone/auth/login.json?locale=en-us&at=ABC74o%2B31mI%2F%2FzQ3GstOJMJJ%2FgdJGAU5PCKXsJ%2B%2BroG%2FyHi2O754P8Ojsak4Ev7LXck%3D"
     login_data = {"j_username": payload.username, "j_password": payload.password, "deviceId": device_id}
     login_data_str = urllib.parse.urlencode(login_data)
 
-    status, body = await do_request("POST", login_url, data=login_data_str)
+    status, body = do_request("POST", login_url, data=login_data_str)
 
     if "Invalid username/password pair" in body or '"status":400,"error":"Bad Request",' in body:
         return {"status": "FAIL"}
     if "userId" not in body:
         return {"status": "BAN/UNKNOWN"}
 
-    # ----- Status Request -----
+    # ----- Status -----
     status_url = "https://www.intl.paramountplus.com/apps-api/v3.0/androidphone/login/status.json?locale=en-us&at=ABAe6KaaPmQXoXXr2FS9yDys4wXLwooaEREtz0c6agC7vrQhjTY%2FYfp1dfSDtu9EbB0%3D"
 
-    status, body2 = await do_request("GET", status_url)
+    status, body2 = do_request("GET", status_url)
 
     if "NEW_FREE_PACKAGE" in body2 or '"planType":null,' in body2:
         return {"status": "FREE/CUSTOM"}
@@ -145,5 +135,5 @@ async def run_check(payload: CheckInput):
     }
 
 @app.get("/health")
-async def health():
+def health():
     return {"status": "ok"}
